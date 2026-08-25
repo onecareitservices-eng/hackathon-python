@@ -1,3 +1,4 @@
+```python
 from flask import Flask, jsonify
 import requests
 from bs4 import BeautifulSoup
@@ -6,6 +7,12 @@ import os
 import re
 
 app = Flask(__name__)
+
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+
+DEVFOLIO_URL = "https://devfolio.co/hackathons"
 
 HEADERS = {
     "User-Agent": (
@@ -18,15 +25,15 @@ HEADERS = {
 
 TIMEOUT = 30
 
-DEVFOLIO_LISTING_URL = "https://devfolio.co/hackathons"
-
 
 # ---------------------------------------------------------
 # REQUEST
 # ---------------------------------------------------------
 
 def get_page(url):
+
     try:
+
         response = requests.get(
             url,
             headers=HEADERS,
@@ -39,10 +46,9 @@ def get_page(url):
 
     except Exception as e:
 
-        print("REQUEST ERROR:", url)
-        print(e)
+        print("REQUEST ERROR:", url, e)
 
-        return None
+        return ""
 
 
 # ---------------------------------------------------------
@@ -72,427 +78,496 @@ def clean_text(value):
 
 
 # ---------------------------------------------------------
-# ABSOLUTE URL
+# URL
 # ---------------------------------------------------------
 
-def absolute_url(base_url, link):
+def absolute_url(base, value):
 
-    if not link:
+    if not value:
         return ""
 
     return urljoin(
-        base_url,
-        link
+        base,
+        value
     )
-
-
-# ---------------------------------------------------------
-# EXTRACT PRIZE
-# ---------------------------------------------------------
-
-def extract_prize(text):
-
-    if not text:
-        return ""
-
-    patterns = [
-        r"(?:₹|Rs\.?|INR)\s?[\d,]+(?:\.\d+)?",
-        r"\$\s?[\d,]+(?:\.\d+)?",
-        r"€\s?[\d,]+(?:\.\d+)?",
-        r"£\s?[\d,]+(?:\.\d+)?"
-    ]
-
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE
-        )
-
-        if match:
-            return clean_text(
-                match.group(0)
-            )
-
-    return ""
-
-
-# ---------------------------------------------------------
-# EXTRACT DEVFOLIO DETAIL LINKS
-# ---------------------------------------------------------
-
-def extract_devfolio_links(html):
-
-    links = []
-
-    if not html:
-        return links
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    for anchor in soup.find_all("a", href=True):
-
-        href = anchor.get("href", "").strip()
-
-        if not href:
-            continue
-
-        full_url = absolute_url(
-            DEVFOLIO_LISTING_URL,
-            href
-        )
-
-        # Devfolio hackathon detail pages
-        if "/hackathons/" not in full_url:
-            continue
-
-        # Remove query/hash
-        full_url = full_url.split("?")[0]
-        full_url = full_url.split("#")[0]
-
-        # Avoid duplicates
-        if full_url not in links:
-            links.append(full_url)
-
-    return links
-
-
-# ---------------------------------------------------------
-# FIND TITLE
-# ---------------------------------------------------------
-
-def extract_title(soup):
-
-    # OpenGraph title
-    tag = soup.find(
-        "meta",
-        property="og:title"
-    )
-
-    if tag and tag.get("content"):
-        return clean_text(
-            tag.get("content")
-        )
-
-    # Twitter title
-    tag = soup.find(
-        "meta",
-        attrs={"name": "twitter:title"}
-    )
-
-    if tag and tag.get("content"):
-        return clean_text(
-            tag.get("content")
-        )
-
-    # HTML title
-    if soup.title:
-        title = soup.title.get_text(
-            " ",
-            strip=True
-        )
-
-        title = re.sub(
-            r"\s*\|\s*Devfolio.*$",
-            "",
-            title,
-            flags=re.IGNORECASE
-        )
-
-        return clean_text(title)
-
-    # H1
-    h1 = soup.find("h1")
-
-    if h1:
-        return clean_text(
-            h1.get_text(" ", strip=True)
-        )
-
-    return ""
-
-
-# ---------------------------------------------------------
-# FIND DESCRIPTION
-# ---------------------------------------------------------
-
-def extract_description(soup):
-
-    # OpenGraph description
-    tag = soup.find(
-        "meta",
-        property="og:description"
-    )
-
-    if tag and tag.get("content"):
-        return clean_text(
-            tag.get("content")
-        )
-
-    # Meta description
-    tag = soup.find(
-        "meta",
-        attrs={"name": "description"}
-    )
-
-    if tag and tag.get("content"):
-        return clean_text(
-            tag.get("content")
-        )
-
-    return ""
 
 
 # ---------------------------------------------------------
 # FIND IMAGE
 # ---------------------------------------------------------
 
-def extract_image(soup):
+def get_image(card):
 
-    tag = soup.find(
-        "meta",
-        property="og:image"
+    img = card.find("img")
+
+    if not img:
+        return ""
+
+    value = (
+        img.get("src")
+        or img.get("data-src")
+        or img.get("data-lazy-src")
+        or ""
     )
 
-    if tag and tag.get("content"):
-        return tag.get("content")
-
-    tag = soup.find(
-        "meta",
-        attrs={"name": "twitter:image"}
+    return absolute_url(
+        DEVFOLIO_URL,
+        value
     )
 
-    if tag and tag.get("content"):
-        return tag.get("content")
+
+# ---------------------------------------------------------
+# FIND THEME
+# ---------------------------------------------------------
+
+def get_theme(card):
+
+    text = clean_text(
+        card.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    # Devfolio card normally contains:
+    #
+    # Theme
+    # AI
+    # Blockchain
+    # Hardware
+    #
+    # We stop when the next known card field begins.
+
+    match = re.search(
+        r"\bTheme\b\s+(.*?)(?="
+        r"\+\d[\d,]*\s+participat"
+        r"|\bOnline\b"
+        r"|\bOffline\b"
+        r"\bOpen\b"
+        r"\bUpcoming\b"
+        r"\bEnded\b"
+        r"\bLive\b"
+        r"\bStarts\b"
+        r"\bOpens\b"
+        r"$"
+        r")",
+        text,
+        re.IGNORECASE
+    )
+
+    if not match:
+        return ""
+
+    theme = clean_text(
+        match.group(1)
+    )
+
+    return theme
+
+
+# ---------------------------------------------------------
+# PARTICIPANTS
+# ---------------------------------------------------------
+
+def get_participants(card):
+
+    text = clean_text(
+        card.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    match = re.search(
+        r"\+?[\d,]+\s+(?:participated|participating)",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return clean_text(
+            match.group(0)
+        )
 
     return ""
 
 
 # ---------------------------------------------------------
-# EXTRACT DETAIL PAGE
+# MODE
 # ---------------------------------------------------------
 
-def extract_devfolio_detail(url):
+def get_mode(card):
 
-    html = get_page(url)
+    text = clean_text(
+        card.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    if re.search(
+        r"\bOnline\b",
+        text,
+        re.IGNORECASE
+    ):
+        return "Online"
+
+    if re.search(
+        r"\bOffline\b",
+        text,
+        re.IGNORECASE
+    ):
+        return "Offline"
+
+    return ""
+
+
+# ---------------------------------------------------------
+# STATUS
+# ---------------------------------------------------------
+
+def get_status(card):
+
+    text = clean_text(
+        card.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    # Check more specific values first.
+
+    if re.search(
+        r"\bEnded\b",
+        text,
+        re.IGNORECASE
+    ):
+        return "Ended"
+
+    if re.search(
+        r"\bUpcoming\b",
+        text,
+        re.IGNORECASE
+    ):
+        return "Upcoming"
+
+    if re.search(
+        r"\bOpen\b",
+        text,
+        re.IGNORECASE
+    ):
+        return "Open"
+
+    if re.search(
+        r"\bLive\b",
+        text,
+        re.IGNORECASE
+    ):
+        return "Live"
+
+    return ""
+
+
+# ---------------------------------------------------------
+# START / OPEN DATE
+# ---------------------------------------------------------
+
+def get_date(card):
+
+    text = clean_text(
+        card.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    # Example:
+    #
+    # Starts 25/09/26
+    # Opens 01/09/26
+
+    match = re.search(
+        r"\b(?:Starts|Opens)\s+"
+        r"(\d{1,2}/\d{1,2}/\d{2,4})",
+        text,
+        re.IGNORECASE
+    )
+
+    if match:
+        return match.group(1)
+
+    return ""
+
+
+# ---------------------------------------------------------
+# TITLE
+# ---------------------------------------------------------
+
+def get_title(anchor, card):
+
+    title = clean_text(
+        anchor.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    if title:
+        return title
+
+    heading = card.find(
+        [
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6"
+        ]
+    )
+
+    if heading:
+
+        return clean_text(
+            heading.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+    return ""
+
+
+# ---------------------------------------------------------
+# FIND CARD
+# ---------------------------------------------------------
+
+def find_card(anchor):
+
+    current = anchor
+
+    for _ in range(10):
+
+        if not current.parent:
+            break
+
+        current = current.parent
+
+        text = clean_text(
+            current.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        # Actual Devfolio card usually contains
+        # Hackathon + Theme + mode/status information.
+
+        if (
+            re.search(
+                r"\bHackathon\b",
+                text,
+                re.IGNORECASE
+            )
+            and
+            re.search(
+                r"\bTheme\b",
+                text,
+                re.IGNORECASE
+            )
+            and
+            len(text) < 2500
+        ):
+
+            return current
+
+    return anchor.parent
+
+
+# ---------------------------------------------------------
+# EXTRACT ACTUAL DEVFOLIO LINKS
+# ---------------------------------------------------------
+
+def get_hackathon_links(soup):
+
+    links = []
+
+    blocked = {
+        "https://devfolio.co/hackathons",
+        "https://devfolio.co/hackathons/open",
+        "https://devfolio.co/hackathons/upcoming",
+        "https://devfolio.co/hackathons/past",
+        "https://devfolio.co/hackathons/applied"
+    }
+
+    for anchor in soup.find_all(
+        "a",
+        href=True
+    ):
+
+        href = anchor.get(
+            "href",
+            ""
+        ).strip()
+
+        if not href:
+            continue
+
+        full_url = absolute_url(
+            DEVFOLIO_URL,
+            href
+        )
+
+        full_url = full_url.split("?")[0]
+        full_url = full_url.split("#")[0]
+
+        # -------------------------------------------------
+        # Do not accept Devfolio category pages
+        # -------------------------------------------------
+
+        if full_url in blocked:
+            continue
+
+        # -------------------------------------------------
+        # We need actual hackathon pages.
+        #
+        # Devfolio hackathon pages normally use
+        # subdomains such as:
+        #
+        # https://something.devfolio.co/
+        #
+        # -------------------------------------------------
+
+        if not re.match(
+            r"^https?://[^/]+\.devfolio\.co/?$",
+            full_url,
+            re.IGNORECASE
+        ):
+
+            continue
+
+        if full_url not in links:
+
+            links.append(
+                (
+                    anchor,
+                    full_url
+                )
+            )
+
+    return links
+
+
+# ---------------------------------------------------------
+# FETCH DEVFOLIO
+# ---------------------------------------------------------
+
+def fetch_devfolio():
+
+    print(
+        "Fetching:",
+        DEVFOLIO_URL
+    )
+
+    html = get_page(
+        DEVFOLIO_URL
+    )
 
     if not html:
-        return None
+
+        return []
 
     soup = BeautifulSoup(
         html,
         "html.parser"
     )
 
-    title = extract_title(
+    links = get_hackathon_links(
         soup
-    )
-
-    description = extract_description(
-        soup
-    )
-
-    image = extract_image(
-        soup
-    )
-
-    page_text = clean_text(
-        soup.get_text(
-            " ",
-            strip=True
-        )
-    )
-
-    # -----------------------------------------------------
-    # Theme
-    # -----------------------------------------------------
-
-    category = ""
-
-    theme_match = re.search(
-        r"Theme\s+(.{1,150}?)(?:Image|Online|Offline|Open|Upcoming|Ended|Starts|Apply now|Remind me)",
-        page_text,
-        re.IGNORECASE
-    )
-
-    if theme_match:
-
-        category = clean_text(
-            theme_match.group(1)
-        )
-
-    # -----------------------------------------------------
-    # Mode
-    # -----------------------------------------------------
-
-    mode = ""
-
-    if re.search(
-        r"\bOnline\b",
-        page_text,
-        re.IGNORECASE
-    ):
-        mode = "Online"
-
-    elif re.search(
-        r"\bOffline\b",
-        page_text,
-        re.IGNORECASE
-    ):
-        mode = "Offline"
-
-    # -----------------------------------------------------
-    # Status
-    # -----------------------------------------------------
-
-    status = ""
-
-    for value in [
-        "Open",
-        "Upcoming",
-        "Live",
-        "Ended"
-    ]:
-
-        if re.search(
-            r"\b" + re.escape(value) + r"\b",
-            page_text,
-            re.IGNORECASE
-        ):
-
-            status = value
-            break
-
-    # -----------------------------------------------------
-    # Start / Open Date
-    # -----------------------------------------------------
-
-    start_date = ""
-
-    date_match = re.search(
-        r"(?:Starts|Opens)\s+"
-        r"(\d{1,2}/\d{1,2}/\d{2})",
-        page_text,
-        re.IGNORECASE
-    )
-
-    if date_match:
-
-        start_date = date_match.group(1)
-
-    # -----------------------------------------------------
-    # Participants
-    # -----------------------------------------------------
-
-    participants = ""
-
-    participant_match = re.search(
-        r"\+?([\d,]+)\s+participat",
-        page_text,
-        re.IGNORECASE
-    )
-
-    if participant_match:
-
-        participants = participant_match.group(1)
-
-    # -----------------------------------------------------
-    # Prize
-    # -----------------------------------------------------
-
-    prize = extract_prize(
-        page_text
-    )
-
-    # -----------------------------------------------------
-    # Return
-    # -----------------------------------------------------
-
-    return {
-        "title": title,
-        "description": description,
-        "prize": prize,
-        "category": category,
-        "deadline": "",
-        "eligibility": "",
-        "link": url,
-        "source": "Devfolio",
-        "image": image,
-        "mode": mode,
-        "status": status,
-        "start_date": start_date,
-        "participants": participants
-    }
-
-
-# ---------------------------------------------------------
-# DEVFOLIO FETCHER
-# ---------------------------------------------------------
-
-def fetch_devfolio():
-
-    print(
-        "Fetching Devfolio..."
-    )
-
-    listing_html = get_page(
-        DEVFOLIO_LISTING_URL
-    )
-
-    if not listing_html:
-
-        print(
-            "Unable to fetch Devfolio listing"
-        )
-
-        return []
-
-    links = extract_devfolio_links(
-        listing_html
     )
 
     print(
-        "Devfolio links found:",
+        "Devfolio actual links found:",
         len(links)
     )
 
     results = []
 
-    # Safety limit
-    # First 50 current listings
-    for index, link in enumerate(
-        links[:50]
-    ):
+    seen = set()
 
-        print(
-            "Fetching:",
-            index + 1,
-            link
+    for anchor, link in links:
+
+        if link in seen:
+            continue
+
+        seen.add(link)
+
+        card = find_card(
+            anchor
         )
 
-        try:
+        title = get_title(
+            anchor,
+            card
+        )
 
-            item = extract_devfolio_detail(
-                link
-            )
+        if not title:
+            continue
 
-            if item and item.get("title"):
+        # Do not accidentally include navigation.
 
-                results.append(
-                    item
-                )
+        if title.lower() in {
+            "open",
+            "upcoming",
+            "past",
+            "applied",
+            "hackathons"
+        }:
+            continue
 
-        except Exception as e:
+        category = get_theme(
+            card
+        )
 
-            print(
-                "DETAIL ERROR:",
-                link,
-                e
-            )
+        participants = get_participants(
+            card
+        )
+
+        mode = get_mode(
+            card
+        )
+
+        status = get_status(
+            card
+        )
+
+        start_date = get_date(
+            card
+        )
+
+        image = get_image(
+            card
+        )
+
+        item = {
+            "title": title,
+            "description": "",
+            "prize": "",
+            "category": category,
+            "deadline": "",
+            "eligibility": "",
+            "link": link,
+            "source": "Devfolio",
+            "image": image,
+            "mode": mode,
+            "status": status,
+            "start_date": start_date,
+            "participants": participants
+        }
+
+        results.append(
+            item
+        )
 
     return results
 
@@ -543,3 +618,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
+```
