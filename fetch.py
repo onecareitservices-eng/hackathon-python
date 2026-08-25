@@ -1,4 +1,3 @@
-```python
 from flask import Flask, jsonify
 import requests
 from bs4 import BeautifulSoup
@@ -618,4 +617,4 @@ if __name__ == "__main__":
         host="0.0.0.0",
         port=port
     )
-```
+
