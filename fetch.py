@@ -1,10 +1,11 @@
 from flask import Flask, jsonify
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
 import os
 import re
 import json
+import time
 
 app = Flask(__name__)
 
@@ -12,58 +13,198 @@ HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/131.0 Safari/537.36"
+        "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9"
 }
 
-TIMEOUT = 25
+TIMEOUT = 15
+
+# Small cache so Render free service is not hit repeatedly
+CACHE = {
+    "time": 0,
+    "data": []
+}
+
+CACHE_SECONDS = 300
 
 
 # =========================================================
-# COMMON FUNCTIONS
+# HTTP
 # =========================================================
 
 def get_page(url):
     try:
-        r = requests.get(
+        response = requests.get(
             url,
             headers=HEADERS,
             timeout=TIMEOUT
         )
-        r.raise_for_status()
-        return r.text
+
+        response.raise_for_status()
+
+        return response.text
 
     except Exception as e:
-        print("REQUEST ERROR:", url, e)
-        return ""
+        print("FETCH ERROR:", url, str(e))
+        return None
 
+
+# =========================================================
+# TEXT
+# =========================================================
 
 def clean_text(value):
-    if not value:
+    if value is None:
         return ""
 
-    text = BeautifulSoup(
-        str(value),
+    value = str(value)
+
+    soup = BeautifulSoup(
+        value,
         "html.parser"
-    ).get_text(
+    )
+
+    value = soup.get_text(
         " ",
         strip=True
     )
 
-    return re.sub(
+    value = re.sub(
         r"\s+",
         " ",
-        text
-    ).strip()
+        value
+    )
+
+    return value.strip()
 
 
-def absolute_url(base, value):
-    if not value:
+# =========================================================
+# URL
+# =========================================================
+
+def absolute_url(base_url, link):
+
+    if not link:
         return ""
 
-    return urljoin(base, value)
+    return urljoin(
+        base_url,
+        link
+    )
 
+
+# =========================================================
+# IMAGE
+# =========================================================
+
+def get_image(img, base_url):
+
+    if not img:
+        return ""
+
+    attributes = [
+        "src",
+        "data-src",
+        "data-lazy-src",
+        "data-original",
+        "data-image"
+    ]
+
+    for attr in attributes:
+
+        value = img.get(attr)
+
+        if value:
+
+            value = value.strip()
+
+            if value.startswith("data:image"):
+                continue
+
+            # Do not use user/avatar images
+            if "/users/" in value:
+                continue
+
+            if "avatar" in value.lower():
+                continue
+
+            return absolute_url(
+                base_url,
+                value
+            )
+
+    # srcset fallback
+
+    srcset = img.get("srcset")
+
+    if srcset:
+
+        parts = srcset.split(",")
+
+        for part in reversed(parts):
+
+            part = part.strip()
+
+            if not part:
+                continue
+
+            image_url = part.split(" ")[0]
+
+            if "/users/" in image_url:
+                continue
+
+            if "avatar" in image_url.lower():
+                continue
+
+            return absolute_url(
+                base_url,
+                image_url
+            )
+
+    return ""
+
+
+def find_actual_image(card, base_url):
+
+    images = card.find_all("img")
+
+    candidates = []
+
+    for img in images:
+
+        image = get_image(
+            img,
+            base_url
+        )
+
+        if not image:
+            continue
+
+        low = image.lower()
+
+        # Ignore profile/avatar images
+        if "/users/" in low:
+            continue
+
+        if "avatar" in low:
+            continue
+
+        if "logo" in low:
+            continue
+
+        candidates.append(image)
+
+    if candidates:
+        return candidates[0]
+
+    return ""
+
+
+# =========================================================
+# ITEM
+# =========================================================
 
 def make_item(
     title="",
@@ -76,10 +217,11 @@ def make_item(
     source="",
     image="",
     mode="",
+    participants="",
     status="",
-    start_date="",
-    participants=""
+    start_date=""
 ):
+
     return {
         "title": clean_text(title),
         "description": clean_text(description),
@@ -91,153 +233,225 @@ def make_item(
         "source": source,
         "image": image,
         "mode": clean_text(mode),
+        "participants": clean_text(participants),
         "status": clean_text(status),
-        "start_date": clean_text(start_date),
-        "participants": clean_text(participants)
+        "start_date": clean_text(start_date)
     }
 
 
-def get_meta(soup, prop=None, name=None):
-    if prop:
-        tag = soup.find(
-            "meta",
-            attrs={"property": prop}
-        )
-    else:
-        tag = soup.find(
-            "meta",
-            attrs={"name": name}
-        )
+# =========================================================
+# JSON-LD
+# =========================================================
 
-    if tag:
-        return clean_text(
-            tag.get("content", "")
-        )
+def extract_jsonld(html, source, base_url):
 
-    return ""
-
-
-def get_basic_page(url, source):
-    html = get_page(url)
+    results = []
 
     if not html:
-        return []
+        return results
 
     soup = BeautifulSoup(
         html,
         "html.parser"
     )
 
-    title = get_meta(
-        soup,
-        prop="og:title"
+    scripts = soup.find_all(
+        "script",
+        attrs={
+            "type": "application/ld+json"
+        }
     )
 
-    if not title and soup.title:
-        title = clean_text(
-            soup.title.get_text()
-        )
+    for script in scripts:
 
-    description = get_meta(
-        soup,
-        prop="og:description"
-    )
+        try:
 
-    if not description:
-        description = get_meta(
-            soup,
-            name="description"
-        )
+            raw = script.string
 
-    image = get_meta(
-        soup,
-        prop="og:image"
-    )
+            if not raw:
+                raw = script.get_text()
 
-    if image:
-        image = absolute_url(
-            url,
-            image
-        )
+            data = json.loads(raw)
 
-    return [
-        make_item(
-            title=title,
-            description=description,
-            link=url,
-            source=source,
-            image=image
-        )
-    ]
+        except Exception:
+            continue
 
+        objects = []
 
-# =========================================================
-# IMAGE
-# =========================================================
+        if isinstance(data, dict):
 
-def get_card_image(card, base_url):
-    candidates = []
-
-    for source in card.find_all("source"):
-        for attr in [
-            "srcset",
-            "data-srcset"
-        ]:
-            value = source.get(
-                attr,
-                ""
-            )
-
-            if value:
-                candidates.append(
-                    value.split(",")[0]
-                    .strip()
-                    .split(" ")[0]
+            if "@graph" in data:
+                objects.extend(
+                    data["@graph"]
                 )
 
-    for img in card.find_all("img"):
-        for attr in [
-            "src",
-            "data-src",
-            "data-lazy-src",
-            "data-original"
-        ]:
-            value = img.get(
-                attr,
+            else:
+                objects.append(data)
+
+        elif isinstance(data, list):
+
+            objects.extend(data)
+
+        for obj in objects:
+
+            if not isinstance(obj, dict):
+                continue
+
+            title = (
+                obj.get("name")
+                or obj.get("headline")
+                or ""
+            )
+
+            description = obj.get(
+                "description",
                 ""
             )
 
-            if value:
-                candidates.append(value)
-
-    # Prefer actual hackathon images.
-    for value in candidates:
-
-        if "/users/" in value:
-            continue
-
-        if (
-            "/hackathons/" in value
-            or "/cover/" in value
-            or "cover" in value.lower()
-        ):
-            return absolute_url(
-                base_url,
-                value
+            link = (
+                obj.get("url")
+                or obj.get("@id")
+                or ""
             )
 
-    # Other non-avatar image.
-    for value in candidates:
+            image = obj.get(
+                "image",
+                ""
+            )
 
-        if "/users/" in value:
-            continue
+            if isinstance(image, list):
 
-        return absolute_url(
-            base_url,
-            value
+                image = (
+                    image[0]
+                    if image
+                    else ""
+                )
+
+            if isinstance(image, dict):
+
+                image = image.get(
+                    "url",
+                    ""
+                )
+
+            link = absolute_url(
+                base_url,
+                link
+            )
+
+            image = absolute_url(
+                base_url,
+                image
+            )
+
+            if title:
+
+                results.append(
+                    make_item(
+                        title=title,
+                        description=description,
+                        link=link or base_url,
+                        source=source,
+                        image=image
+                    )
+                )
+
+    return results
+
+
+# =========================================================
+# META
+# =========================================================
+
+def get_meta(
+    soup,
+    property_name="",
+    name=""
+):
+
+    if property_name:
+
+        tag = soup.find(
+            "meta",
+            attrs={
+                "property": property_name
+            }
+        )
+
+    else:
+
+        tag = soup.find(
+            "meta",
+            attrs={
+                "name": name
+            }
+        )
+
+    if tag:
+
+        return tag.get(
+            "content",
+            ""
         )
 
     return ""
+
+
+# =========================================================
+# CARD TEXT HELPERS
+# =========================================================
+
+def card_text(card):
+
+    return clean_text(
+        card.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+
+def find_nearest_card(anchor):
+
+    # Try common card elements first
+
+    for tag_name in [
+        "article",
+        "li"
+    ]:
+
+        parent = anchor.find_parent(
+            tag_name
+        )
+
+        if parent:
+
+            text = card_text(parent)
+
+            if len(text) > 30:
+
+                return parent
+
+    # Generic parent fallback
+
+    parent = anchor
+
+    for _ in range(6):
+
+        parent = parent.parent
+
+        if not parent:
+            break
+
+        text = card_text(parent)
+
+        if 40 < len(text) < 2500:
+
+            if parent.find("img"):
+
+                return parent
+
+    return anchor.parent
 
 
 # =========================================================
@@ -245,7 +459,9 @@ def get_card_image(card, base_url):
 # =========================================================
 
 def fetch_devfolio():
+
     source = "Devfolio"
+
     url = "https://devfolio.co/hackathons"
 
     html = get_page(url)
@@ -261,74 +477,58 @@ def fetch_devfolio():
     results = []
     seen = set()
 
-    blocked_hosts = {
-        "guide.devfolio.co",
-        "status.devfolio.co"
-    }
+    # Devfolio hackathon pages normally use
+    # *.devfolio.co links
 
-    for anchor in soup.find_all(
+    anchors = soup.find_all(
         "a",
         href=True
-    ):
+    )
+
+    for anchor in anchors:
 
         href = anchor.get(
             "href",
             ""
-        ).strip()
+        )
 
-        full_url = absolute_url(
+        if not href:
+            continue
+
+        full_link = absolute_url(
             url,
             href
-        ).split("?")[0].split("#")[0]
-
-        parsed = urlparse(
-            full_url
         )
 
-        host = parsed.netloc.lower()
-
-        if not host.endswith(
-            ".devfolio.co"
-        ):
+        # Actual hackathon pages
+        if ".devfolio.co" not in full_link:
             continue
 
-        if host in blocked_hosts:
+        if full_link.rstrip("/") == url.rstrip("/"):
             continue
 
-        if full_url in seen:
+        # Ignore social/external links
+        if any(x in full_link.lower() for x in [
+            "twitter.com",
+            "x.com",
+            "discord",
+            "instagram.com",
+            "facebook.com"
+        ]):
             continue
 
-        seen.add(full_url)
-
-        card = anchor
-
-        for _ in range(12):
-
-            if not card.parent:
-                break
-
-            card = card.parent
-
-            text = clean_text(
-                card.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-            if (
-                "Hackathon" in text
-                and "Theme" in text
-                and len(text) < 3000
-            ):
-                break
-
-        text = clean_text(
-            card.get_text(
-                " ",
-                strip=True
-            )
+        card = find_nearest_card(
+            anchor
         )
+
+        if not card:
+            continue
+
+        text = card_text(card)
+
+        # Ignore tiny/invalid cards
+        if len(text) < 20:
+            continue
 
         title = clean_text(
             anchor.get_text(
@@ -338,60 +538,40 @@ def fetch_devfolio():
         )
 
         if not title:
-            continue
-
-        if title.lower() in {
-            "documentation",
-            "status",
-            "guide"
-        }:
-            continue
-
-        category = ""
-
-        theme = re.search(
-            r"\bTheme\b\s+(.*?)(?="
-            r"\+\s*[\d,]+\s+(?:participated|participating)"
-            r"|\bOnline\b"
-            r"|\bOffline\b"
-            r"\bOpen\b"
-            r"\bUpcoming\b"
-            r"\bEnded\b"
-            r"\bLive\b"
-            r"\bStarts\b"
-            r"\bOpens\b"
-            r"$"
-            r")",
-            text,
-            re.I
-        )
-
-        if theme:
-            category = clean_text(
-                theme.group(1)
+            title_tag = card.find(
+                [
+                    "h1",
+                    "h2",
+                    "h3",
+                    "h4",
+                    "h5"
+                ]
             )
 
-        category = re.sub(
-            r"\s*\+\s*[\d,]+\s+"
-            r"(?:participated|participating).*?$",
-            "",
-            category,
-            flags=re.I
-        ).strip()
+            if title_tag:
+                title = clean_text(
+                    title_tag.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
 
-        participants = ""
+        if not title:
+            continue
 
-        match = re.search(
-            r"\+?\s*[\d,]+\s+"
-            r"(?:participated|participating)",
-            text,
-            re.I
+        # Remove generic labels
+        if title.lower() in [
+            "hackathon",
+            "apply now",
+            "see projects",
+            "remind me"
+        ]:
+            continue
+
+        image = find_actual_image(
+            card,
+            url
         )
-
-        if match:
-            participants = clean_text(
-                match.group(0)
-            )
 
         mode = ""
 
@@ -411,48 +591,458 @@ def fetch_devfolio():
 
         status = ""
 
-        for value in [
-            "Ended",
-            "Upcoming",
-            "Open",
-            "Live"
-        ]:
-            if re.search(
-                r"\b" + value + r"\b",
-                text,
-                re.I
-            ):
-                status = value
-                break
+        if re.search(
+            r"\bUpcoming\b",
+            text,
+            re.I
+        ):
+            status = "Upcoming"
 
-        start_date = ""
+        elif re.search(
+            r"\bOpen\b",
+            text,
+            re.I
+        ):
+            status = "Open"
 
-        date_match = re.search(
-            r"\b(?:Starts|Opens)\s+"
-            r"(\d{1,2}/\d{1,2}/\d{2,4})",
+        elif re.search(
+            r"\bEnded\b",
+            text,
+            re.I
+        ):
+            status = "Ended"
+
+        if re.search(
+            r"\bLive\b",
+            text,
+            re.I
+        ):
+            status = "Live"
+
+        participants = ""
+
+        match = re.search(
+            r"\+[\d,]+\s+(?:participating|participated)",
             text,
             re.I
         )
 
-        if date_match:
-            start_date = date_match.group(1)
+        if match:
+            participants = clean_text(
+                match.group(0)
+            )
 
-        image = get_card_image(
-            card,
-            url
+        start_date = ""
+
+        match = re.search(
+            r"(?:Starts|Opens)\s+(\d{1,2}/\d{1,2}/\d{2})",
+            text,
+            re.I
         )
+
+        if match:
+
+            start_date = match.group(1)
+
+        category_parts = []
+
+        known_themes = [
+            "AI",
+            "Blockchain",
+            "FinTech",
+            "Hardware",
+            "Design",
+            "HealthTech",
+            "Future Mobility",
+            "Web3",
+            "Gaming",
+            "No Restrictions"
+        ]
+
+        for theme in known_themes:
+
+            if re.search(
+                r"\b" + re.escape(theme) + r"\b",
+                text,
+                re.I
+            ):
+                category_parts.append(
+                    theme
+                )
+
+        category = ", ".join(
+            dict.fromkeys(
+                category_parts
+            )
+        )
+
+        key = (
+            title.lower(),
+            full_link
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
 
         results.append(
             make_item(
                 title=title,
+                description="",
+                prize="",
                 category=category,
-                link=full_url,
+                deadline="",
+                eligibility="",
+                link=full_link,
                 source=source,
                 image=image,
                 mode=mode,
+                participants=participants,
                 status=status,
-                start_date=start_date,
-                participants=participants
+                start_date=start_date
+            )
+        )
+
+    return results
+
+
+# =========================================================
+# GENERIC CARD FETCHER
+# =========================================================
+
+def fetch_cards(
+    url,
+    source,
+    allowed_domains=None
+):
+
+    html = get_page(url)
+
+    if not html:
+        return []
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
+
+    results = []
+    seen = set()
+
+    # First try JSON-LD
+    jsonld = extract_jsonld(
+        html,
+        source,
+        url
+    )
+
+    for item in jsonld:
+
+        if item["title"]:
+
+            key = (
+                item["title"].lower(),
+                item["link"]
+            )
+
+            if key not in seen:
+
+                seen.add(key)
+
+                results.append(
+                    item
+                )
+
+    # Then actual HTML cards
+
+    anchors = soup.find_all(
+        "a",
+        href=True
+    )
+
+    for anchor in anchors:
+
+        href = anchor.get(
+            "href",
+            ""
+        )
+
+        if not href:
+            continue
+
+        full_link = absolute_url(
+            url,
+            href
+        )
+
+        if allowed_domains:
+
+            if not any(
+                domain in full_link
+                for domain in allowed_domains
+            ):
+                continue
+
+        card = find_nearest_card(
+            anchor
+        )
+
+        if not card:
+            continue
+
+        text = card_text(card)
+
+        if len(text) < 35:
+            continue
+
+        image = find_actual_image(
+            card,
+            url
+        )
+
+        # Ignore cards without useful content
+        if not image and len(text) < 60:
+            continue
+
+        title = clean_text(
+            anchor.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if not title:
+
+            heading = card.find(
+                [
+                    "h1",
+                    "h2",
+                    "h3",
+                    "h4",
+                    "h5",
+                    "h6"
+                ]
+            )
+
+            if heading:
+
+                title = clean_text(
+                    heading.get_text(
+                        " ",
+                        strip=True
+                    )
+                )
+
+        if not title:
+            continue
+
+        # Avoid navigation links
+        bad_titles = [
+            "login",
+            "sign up",
+            "register",
+            "apply now",
+            "learn more",
+            "view all",
+            "home",
+            "hackathons",
+            "competitions"
+        ]
+
+        if title.lower() in bad_titles:
+            continue
+
+        status = ""
+
+        for value in [
+            "Open",
+            "Upcoming",
+            "Live",
+            "Ended",
+            "Ongoing",
+            "Pre-registration",
+            "Registration closed"
+        ]:
+
+            if re.search(
+                r"\b" + re.escape(value) + r"\b",
+                text,
+                re.I
+            ):
+
+                status = value
+                break
+
+        mode = ""
+
+        if re.search(
+            r"\bOnline\b",
+            text,
+            re.I
+        ):
+            mode = "Online"
+
+        elif re.search(
+            r"\bVirtual\b",
+            text,
+            re.I
+        ):
+            mode = "Virtual"
+
+        elif re.search(
+            r"\bOffline\b",
+            text,
+            re.I
+        ):
+            mode = "Offline"
+
+        elif re.search(
+            r"\bIn[- ]person\b",
+            text,
+            re.I
+        ):
+            mode = "In-person"
+
+        participants = ""
+
+        participant_patterns = [
+            r"\+[\d,]+\s+(?:participating|participated)",
+            r"[\d,]+\s+participants?",
+            r"[\d,]+\s+teams?"
+        ]
+
+        for pattern in participant_patterns:
+
+            match = re.search(
+                pattern,
+                text,
+                re.I
+            )
+
+            if match:
+
+                participants = clean_text(
+                    match.group(0)
+                )
+
+                break
+
+        prize = ""
+
+        prize_patterns = [
+            r"(?:₹|Rs\.?|INR)\s?[\d,]+(?:\s?(?:Lakh|Crore))?",
+            r"\$[\d,]+(?:\.\d+)?",
+            r"[\d,]+\s*(?:USD|INR)",
+            r"(?:Prize Pool|Prize)\s*[:\-]?\s*[₹$]?\s?[\d,]+"
+        ]
+
+        for pattern in prize_patterns:
+
+            match = re.search(
+                pattern,
+                text,
+                re.I
+            )
+
+            if match:
+
+                prize = clean_text(
+                    match.group(0)
+                )
+
+                break
+
+        date_patterns = [
+            r"\d{1,2}/\d{1,2}/\d{2,4}",
+            r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}",
+            r"[A-Za-z]{3,9}\s+\d{1,2}\s*[-–]\s*\d{1,2}",
+            r"[A-Za-z]{3,9}\s+\d{1,2}\s*-\s*[A-Za-z]{3,9}\s+\d{1,2}"
+        ]
+
+        start_date = ""
+
+        for pattern in date_patterns:
+
+            match = re.search(
+                pattern,
+                text
+            )
+
+            if match:
+
+                start_date = match.group(0)
+
+                break
+
+        category = ""
+
+        known_categories = [
+            "AI",
+            "Artificial Intelligence",
+            "Blockchain",
+            "Web3",
+            "FinTech",
+            "Gaming",
+            "Design",
+            "Hardware",
+            "HealthTech",
+            "Cybersecurity",
+            "Data Science",
+            "Machine Learning",
+            "Cloud",
+            "IoT",
+            "Software Development",
+            "Future Mobility",
+            "Quantum",
+            "Biohack"
+        ]
+
+        found_categories = []
+
+        for category_name in known_categories:
+
+            if re.search(
+                r"\b" + re.escape(category_name) + r"\b",
+                text,
+                re.I
+            ):
+
+                found_categories.append(
+                    category_name
+                )
+
+        category = ", ".join(
+            dict.fromkeys(
+                found_categories
+            )
+        )
+
+        key = (
+            title.lower(),
+            full_link
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        results.append(
+            make_item(
+                title=title,
+                description="",
+                prize=prize,
+                category=category,
+                deadline="",
+                eligibility="",
+                link=full_link,
+                source=source,
+                image=image,
+                mode=mode,
+                participants=participants,
+                status=status,
+                start_date=start_date
             )
         )
 
@@ -464,122 +1054,23 @@ def fetch_devfolio():
 # =========================================================
 
 def fetch_unstop():
-    source = "Unstop"
-    url = "https://unstop.com/hackathons"
 
-    html = get_page(url)
-
-    if not html:
-        return []
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
+    return fetch_cards(
+        "https://unstop.com/hackathons?oppstatus=open",
+        "Unstop",
+        [
+            "unstop.com/hackathons"
+        ]
     )
 
-    results = []
-    seen = set()
 
-    for anchor in soup.find_all(
-        "a",
-        href=True
-    ):
+# =========================================================
+# DEVFOLIO
+# =========================================================
 
-        href = anchor.get(
-            "href",
-            ""
-        )
+def fetch_devfolio_source():
 
-        if "hackathon" not in href.lower():
-            continue
-
-        link = absolute_url(
-            url,
-            href
-        )
-
-        if link in seen:
-            continue
-
-        seen.add(link)
-
-        card = anchor
-
-        for _ in range(8):
-            if not card.parent:
-                break
-
-            card = card.parent
-
-            text = clean_text(
-                card.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-            if len(text) < 2000:
-                break
-
-        title = clean_text(
-            anchor.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not title:
-            heading = card.find(
-                ["h1", "h2", "h3", "h4"]
-            )
-
-            if heading:
-                title = clean_text(
-                    heading.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-        if not title:
-            continue
-
-        image = get_card_image(
-            card,
-            url
-        )
-
-        text = clean_text(
-            card.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        prize = ""
-
-        prize_match = re.search(
-            r"(?:₹|Rs\.?|INR)\s?"
-            r"[\d,]+(?:\.\d+)?",
-            text,
-            re.I
-        )
-
-        if prize_match:
-            prize = prize_match.group(0)
-
-        results.append(
-            make_item(
-                title=title,
-                description="",
-                prize=prize,
-                link=link,
-                source=source,
-                image=image
-            )
-        )
-
-    return results
+    return fetch_devfolio()
 
 
 # =========================================================
@@ -587,12 +1078,13 @@ def fetch_unstop():
 # =========================================================
 
 def fetch_hackerearth():
-    source = "HackerEarth"
-    url = "https://www.hackerearth.com/challenges/"
 
-    return get_basic_page(
-        url,
-        source
+    return fetch_cards(
+        "https://www.hackerearth.com/challenges/",
+        "HackerEarth",
+        [
+            "hackerearth.com/challenges"
+        ]
     )
 
 
@@ -601,12 +1093,13 @@ def fetch_hackerearth():
 # =========================================================
 
 def fetch_hack2skill():
-    source = "Hack2Skill"
-    url = "https://hack2skill.com/"
 
-    return get_basic_page(
-        url,
-        source
+    return fetch_cards(
+        "https://hack2skill.com/",
+        "Hack2Skill",
+        [
+            "hack2skill.com"
+        ]
     )
 
 
@@ -615,77 +1108,13 @@ def fetch_hack2skill():
 # =========================================================
 
 def fetch_devpost():
-    source = "Devpost"
-    url = "https://devpost.com/hackathons"
 
-    html = get_page(url)
-
-    if not html:
-        return []
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    results = []
-    seen = set()
-
-    for anchor in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = anchor.get(
-            "href",
-            ""
-        )
-
-        if "/software/" not in href:
-            continue
-
-        link = absolute_url(
-            url,
-            href
-        )
-
-        if link in seen:
-            continue
-
-        seen.add(link)
-
-        title = clean_text(
-            anchor.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not title:
-            continue
-
-        card = anchor.parent
-
-        image = get_card_image(
-            card,
-            url
-        )
-
-        results.append(
-            make_item(
-                title=title,
-                link=link,
-                source=source,
-                image=image
-            )
-        )
-
-    if results:
-        return results
-
-    return get_basic_page(
-        url,
-        source
+    return fetch_cards(
+        "https://devpost.com/hackathons",
+        "Devpost",
+        [
+            "devpost.com"
+        ]
     )
 
 
@@ -694,101 +1123,13 @@ def fetch_devpost():
 # =========================================================
 
 def fetch_mlh():
-    source = "MLH"
-    url = "https://mlh.io/seasons/2026/events"
 
-    html = get_page(url)
-
-    if not html:
-        return []
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    results = []
-
-    for card in soup.find_all(
-        class_=re.compile(
-            r"event|hackathon",
-            re.I
-        )
-    ):
-
-        text = clean_text(
-            card.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        link_tag = card.find(
-            "a",
-            href=True
-        )
-
-        if not link_tag:
-            continue
-
-        link = absolute_url(
-            url,
-            link_tag.get(
-                "href"
-            )
-        )
-
-        title = ""
-
-        heading = card.find(
-            [
-                "h1",
-                "h2",
-                "h3",
-                "h4",
-                "h5"
-            ]
-        )
-
-        if heading:
-            title = clean_text(
-                heading.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-        if not title:
-            title = clean_text(
-                link_tag.get_text(
-                    " ",
-                    strip=True
-                )
-            )
-
-        if not title:
-            continue
-
-        image = get_card_image(
-            card,
-            url
-        )
-
-        results.append(
-            make_item(
-                title=title,
-                link=link,
-                source=source,
-                image=image
-            )
-        )
-
-    if results:
-        return results
-
-    return get_basic_page(
-        url,
-        source
+    return fetch_cards(
+        "https://www.mlh.com/seasons/2026/events",
+        "MLH",
+        [
+            "mlh.io"
+        ]
     )
 
 
@@ -797,12 +1138,13 @@ def fetch_mlh():
 # =========================================================
 
 def fetch_kaggle():
-    source = "Kaggle"
-    url = "https://www.kaggle.com/competitions"
 
-    return get_basic_page(
-        url,
-        source
+    return fetch_cards(
+        "https://www.kaggle.com/competitions?requireHackathons=true",
+        "Kaggle",
+        [
+            "kaggle.com/competitions"
+        ]
     )
 
 
@@ -811,94 +1153,80 @@ def fetch_kaggle():
 # =========================================================
 
 def fetch_dorahacks():
-    source = "DoraHacks"
-    url = "https://dorahacks.io/hackathon"
 
-    html = get_page(url)
-
-    if not html:
-        return []
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
+    return fetch_cards(
+        "https://dorahacks.io/hackathon",
+        "DoraHacks",
+        [
+            "dorahacks.io/hackathon"
+        ]
     )
 
-    results = []
+
+# =========================================================
+# REMOVE DUPLICATES
+# =========================================================
+
+def remove_duplicates(items):
+
+    output = []
     seen = set()
 
-    for anchor in soup.find_all(
-        "a",
-        href=True
-    ):
-
-        href = anchor.get(
-            "href",
-            ""
-        )
-
-        if (
-            "hackathon" not in href.lower()
-            and "buidl" not in href.lower()
-        ):
-            continue
-
-        link = absolute_url(
-            url,
-            href
-        )
-
-        if link in seen:
-            continue
-
-        seen.add(link)
+    for item in items:
 
         title = clean_text(
-            anchor.get_text(
-                " ",
-                strip=True
-            )
+            item.get("title", "")
+        )
+
+        link = item.get(
+            "link",
+            ""
         )
 
         if not title:
             continue
 
-        card = anchor.parent
-
-        image = get_card_image(
-            card,
-            url
+        key = (
+            title.lower(),
+            link
         )
 
-        results.append(
-            make_item(
-                title=title,
-                link=link,
-                source=source,
-                image=image
-            )
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        output.append(
+            item
         )
 
-    if results:
-        return results
-
-    return get_basic_page(
-        url,
-        source
-    )
+    return output
 
 
 # =========================================================
-# FETCH ALL 8 PLATFORMS
+# FETCH ALL
 # =========================================================
 
 def fetch_all():
+
+    global CACHE
+
+    now = time.time()
+
+    # Cache
+    if (
+        CACHE["data"]
+        and
+        now - CACHE["time"] < CACHE_SECONDS
+    ):
+
+        return CACHE["data"]
 
     all_items = []
 
     fetchers = [
         fetch_unstop,
-        fetch_devfolio,
+        fetch_devfolio_source,
         fetch_hackerearth,
         fetch_hack2skill,
         fetch_devpost,
@@ -909,35 +1237,42 @@ def fetch_all():
 
     for fetcher in fetchers:
 
-        print(
-            "================================"
-        )
-
-        print(
-            "SOURCE:",
-            fetcher.__name__
-        )
-
         try:
+
+            print(
+                "Fetching:",
+                fetcher.__name__
+            )
 
             data = fetcher()
 
-            print(
-                "RECORDS:",
-                len(data)
-            )
+            if data:
 
-            all_items.extend(
-                data
-            )
+                print(
+                    fetcher.__name__,
+                    "=>",
+                    len(data),
+                    "items"
+                )
+
+                all_items.extend(
+                    data
+                )
 
         except Exception as e:
 
             print(
                 "PLATFORM ERROR:",
                 fetcher.__name__,
-                e
+                str(e)
             )
+
+    all_items = remove_duplicates(
+        all_items
+    )
+
+    CACHE["time"] = now
+    CACHE["data"] = all_items
 
     return all_items
 
