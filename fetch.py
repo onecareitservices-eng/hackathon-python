@@ -1,7 +1,7 @@
 from flask import Flask, jsonify
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import os
 import re
 import json
@@ -15,13 +15,12 @@ HEADERS = {
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/131.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9"
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 }
 
-TIMEOUT = 15
+TIMEOUT = 20
 
-# Small cache so Render free service is not hit repeatedly
 CACHE = {
     "time": 0,
     "data": []
@@ -31,15 +30,17 @@ CACHE_SECONDS = 300
 
 
 # =========================================================
-# HTTP
+# COMMON
 # =========================================================
 
 def get_page(url):
+
     try:
         response = requests.get(
             url,
             headers=HEADERS,
-            timeout=TIMEOUT
+            timeout=TIMEOUT,
+            allow_redirects=True
         )
 
         response.raise_for_status()
@@ -47,164 +48,42 @@ def get_page(url):
         return response.text
 
     except Exception as e:
-        print("FETCH ERROR:", url, str(e))
-        return None
 
+        print("FETCH ERROR:", url, e)
 
-# =========================================================
-# TEXT
-# =========================================================
+        return ""
+
 
 def clean_text(value):
+
     if value is None:
         return ""
 
-    value = str(value)
-
-    soup = BeautifulSoup(
-        value,
+    text = BeautifulSoup(
+        str(value),
         "html.parser"
-    )
-
-    value = soup.get_text(
+    ).get_text(
         " ",
         strip=True
     )
 
-    value = re.sub(
+    return re.sub(
         r"\s+",
         " ",
-        value
-    )
-
-    return value.strip()
+        text
+    ).strip()
 
 
-# =========================================================
-# URL
-# =========================================================
+def absolute_url(base, value):
 
-def absolute_url(base_url, link):
-
-    if not link:
+    if not value:
         return ""
 
     return urljoin(
-        base_url,
-        link
+        base,
+        value
     )
 
-
-# =========================================================
-# IMAGE
-# =========================================================
-
-def get_image(img, base_url):
-
-    if not img:
-        return ""
-
-    attributes = [
-        "src",
-        "data-src",
-        "data-lazy-src",
-        "data-original",
-        "data-image"
-    ]
-
-    for attr in attributes:
-
-        value = img.get(attr)
-
-        if value:
-
-            value = value.strip()
-
-            if value.startswith("data:image"):
-                continue
-
-            # Do not use user/avatar images
-            if "/users/" in value:
-                continue
-
-            if "avatar" in value.lower():
-                continue
-
-            return absolute_url(
-                base_url,
-                value
-            )
-
-    # srcset fallback
-
-    srcset = img.get("srcset")
-
-    if srcset:
-
-        parts = srcset.split(",")
-
-        for part in reversed(parts):
-
-            part = part.strip()
-
-            if not part:
-                continue
-
-            image_url = part.split(" ")[0]
-
-            if "/users/" in image_url:
-                continue
-
-            if "avatar" in image_url.lower():
-                continue
-
-            return absolute_url(
-                base_url,
-                image_url
-            )
-
-    return ""
-
-
-def find_actual_image(card, base_url):
-
-    images = card.find_all("img")
-
-    candidates = []
-
-    for img in images:
-
-        image = get_image(
-            img,
-            base_url
-        )
-
-        if not image:
-            continue
-
-        low = image.lower()
-
-        # Ignore profile/avatar images
-        if "/users/" in low:
-            continue
-
-        if "avatar" in low:
-            continue
-
-        if "logo" in low:
-            continue
-
-        candidates.append(image)
-
-    if candidates:
-        return candidates[0]
-
-    return ""
-
-
-# =========================================================
-# ITEM
-# =========================================================
 
 def make_item(
     title="",
@@ -240,10 +119,134 @@ def make_item(
 
 
 # =========================================================
+# IMAGE
+# =========================================================
+
+def clean_image(value):
+
+    if not value:
+        return ""
+
+    value = value.strip()
+
+    if value.startswith("data:image"):
+        return ""
+
+    if "/users/" in value.lower():
+        return ""
+
+    if "avatar" in value.lower():
+        return ""
+
+    return value
+
+
+def get_card_image(card, base_url):
+
+    if not card:
+        return ""
+
+    candidates = []
+
+    # IMG
+    for img in card.find_all("img"):
+
+        for attr in [
+            "src",
+            "data-src",
+            "data-lazy-src",
+            "data-original",
+            "data-image"
+        ]:
+
+            value = img.get(attr)
+
+            if value:
+                candidates.append(value)
+
+        srcset = img.get("srcset")
+
+        if srcset:
+
+            for part in srcset.split(","):
+
+                value = (
+                    part.strip()
+                    .split(" ")[0]
+                )
+
+                if value:
+                    candidates.append(value)
+
+    # SOURCE
+    for source in card.find_all("source"):
+
+        for attr in [
+            "srcset",
+            "data-srcset"
+        ]:
+
+            value = source.get(attr)
+
+            if value:
+
+                for part in value.split(","):
+
+                    image = (
+                        part.strip()
+                        .split(" ")[0]
+                    )
+
+                    if image:
+                        candidates.append(image)
+
+    # Prefer actual hackathon/competition assets
+    for value in candidates:
+
+        value = clean_image(value)
+
+        if not value:
+            continue
+
+        low = value.lower()
+
+        if (
+            "/hackathons/" in low
+            or "/hackathon/" in low
+            or "/cover/" in low
+            or "cover" in low
+            or "competition" in low
+        ):
+
+            return absolute_url(
+                base_url,
+                value
+            )
+
+    # Any non-avatar image
+    for value in candidates:
+
+        value = clean_image(value)
+
+        if value:
+
+            return absolute_url(
+                base_url,
+                value
+            )
+
+    return ""
+
+
+# =========================================================
 # JSON-LD
 # =========================================================
 
-def extract_jsonld(html, source, base_url):
+def extract_jsonld(
+    html,
+    source,
+    base_url
+):
 
     results = []
 
@@ -266,10 +269,10 @@ def extract_jsonld(html, source, base_url):
 
         try:
 
-            raw = script.string
-
-            if not raw:
-                raw = script.get_text()
+            raw = (
+                script.string
+                or script.get_text()
+            )
 
             data = json.loads(raw)
 
@@ -280,12 +283,17 @@ def extract_jsonld(html, source, base_url):
 
         if isinstance(data, dict):
 
-            if "@graph" in data:
+            if isinstance(
+                data.get("@graph"),
+                list
+            ):
+
                 objects.extend(
                     data["@graph"]
                 )
 
             else:
+
                 objects.append(data)
 
         elif isinstance(data, list):
@@ -334,124 +342,448 @@ def extract_jsonld(html, source, base_url):
                     ""
                 )
 
-            link = absolute_url(
-                base_url,
-                link
-            )
+            if not title:
+                continue
 
-            image = absolute_url(
-                base_url,
-                image
-            )
-
-            if title:
-
-                results.append(
-                    make_item(
-                        title=title,
-                        description=description,
-                        link=link or base_url,
-                        source=source,
-                        image=image
+            results.append(
+                make_item(
+                    title=title,
+                    description=description,
+                    link=absolute_url(
+                        base_url,
+                        link
+                    ),
+                    source=source,
+                    image=absolute_url(
+                        base_url,
+                        image
                     )
                 )
+            )
 
     return results
 
 
 # =========================================================
-# META
+# CARD
 # =========================================================
 
-def get_meta(
-    soup,
-    property_name="",
-    name=""
-):
+def get_card(anchor):
 
-    if property_name:
+    # Prefer article
+    article = anchor.find_parent("article")
 
-        tag = soup.find(
-            "meta",
-            attrs={
-                "property": property_name
-            }
+    if article:
+        return article
+
+    # Prefer li
+    li = anchor.find_parent("li")
+
+    if li:
+
+        text = clean_text(
+            li.get_text(
+                " ",
+                strip=True
+            )
         )
 
-    else:
-
-        tag = soup.find(
-            "meta",
-            attrs={
-                "name": name
-            }
-        )
-
-    if tag:
-
-        return tag.get(
-            "content",
-            ""
-        )
-
-    return ""
-
-
-# =========================================================
-# CARD TEXT HELPERS
-# =========================================================
-
-def card_text(card):
-
-    return clean_text(
-        card.get_text(
-            " ",
-            strip=True
-        )
-    )
-
-
-def find_nearest_card(anchor):
-
-    # Try common card elements first
-
-    for tag_name in [
-        "article",
-        "li"
-    ]:
-
-        parent = anchor.find_parent(
-            tag_name
-        )
-
-        if parent:
-
-            text = card_text(parent)
-
-            if len(text) > 30:
-
-                return parent
-
-    # Generic parent fallback
+        if len(text) > 25:
+            return li
 
     parent = anchor
 
-    for _ in range(6):
+    for _ in range(8):
 
         parent = parent.parent
 
         if not parent:
             break
 
-        text = card_text(parent)
+        text = clean_text(
+            parent.get_text(
+                " ",
+                strip=True
+            )
+        )
 
-        if 40 < len(text) < 2500:
+        if (
+            len(text) >= 40
+            and len(text) <= 3000
+            and parent.find("img")
+        ):
 
-            if parent.find("img"):
-
-                return parent
+            return parent
 
     return anchor.parent
+
+
+def get_title(anchor, card):
+
+    title = clean_text(
+        anchor.get_text(
+            " ",
+            strip=True
+        )
+    )
+
+    if title:
+        return title
+
+    heading = card.find(
+        [
+            "h1",
+            "h2",
+            "h3",
+            "h4",
+            "h5",
+            "h6"
+        ]
+    )
+
+    if heading:
+
+        return clean_text(
+            heading.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+    return ""
+
+
+def get_mode(text):
+
+    if re.search(
+        r"\bOnline\b",
+        text,
+        re.I
+    ):
+        return "Online"
+
+    if re.search(
+        r"\bVirtual\b",
+        text,
+        re.I
+    ):
+        return "Virtual"
+
+    if re.search(
+        r"\bOffline\b",
+        text,
+        re.I
+    ):
+        return "Offline"
+
+    if re.search(
+        r"\bIn[- ]person\b",
+        text,
+        re.I
+    ):
+        return "In-person"
+
+    return ""
+
+
+def get_status(text):
+
+    statuses = [
+        "Registration closed",
+        "Pre-registration",
+        "Upcoming",
+        "Ongoing",
+        "Live",
+        "Open",
+        "Ended"
+    ]
+
+    for status in statuses:
+
+        if re.search(
+            r"\b" + re.escape(status) + r"\b",
+            text,
+            re.I
+        ):
+
+            return status
+
+    return ""
+
+
+def get_participants(text):
+
+    patterns = [
+        r"\+[\d,]+\s+(?:participating|participated)",
+        r"[\d,]+\s+participants?",
+        r"[\d,]+\s+teams?"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
+
+        if match:
+            return clean_text(
+                match.group(0)
+            )
+
+    return ""
+
+
+def get_prize(text):
+
+    patterns = [
+
+        r"(?:₹|Rs\.?|INR)\s?[\d,]+(?:\.\d+)?",
+
+        r"\$[\d,]+(?:\.\d+)?",
+
+        r"[\d,]+\s*(?:USD|INR)",
+
+        r"(?:Prize Pool|Prize)\s*[:\-]?\s*"
+        r"[₹$]?\s?[\d,]+"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text,
+            re.I
+        )
+
+        if match:
+            return clean_text(
+                match.group(0)
+            )
+
+    return ""
+
+
+def get_date(text):
+
+    patterns = [
+
+        r"\d{1,2}/\d{1,2}/\d{2,4}",
+
+        r"\d{1,2}\s+"
+        r"[A-Za-z]{3,9}\s+"
+        r"\d{4}",
+
+        r"[A-Za-z]{3,9}\s+"
+        r"\d{1,2}"
+        r"\s*[-–]\s*"
+        r"\d{1,2}",
+
+        r"[A-Za-z]{3,9}\s+"
+        r"\d{1,2}"
+        r"\s*-\s*"
+        r"[A-Za-z]{3,9}\s+"
+        r"\d{1,2}"
+    ]
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            text
+        )
+
+        if match:
+
+            return match.group(0)
+
+    return ""
+
+
+def get_category(text):
+
+    categories = [
+        "AI",
+        "Artificial Intelligence",
+        "Blockchain",
+        "Web3",
+        "FinTech",
+        "Gaming",
+        "Design",
+        "Hardware",
+        "HealthTech",
+        "Cybersecurity",
+        "Data Science",
+        "Machine Learning",
+        "Cloud",
+        "IoT",
+        "Software Development",
+        "Future Mobility",
+        "Quantum",
+        "BioTech"
+    ]
+
+    found = []
+
+    for category in categories:
+
+        if re.search(
+            r"\b" + re.escape(category) + r"\b",
+            text,
+            re.I
+        ):
+
+            found.append(category)
+
+    return ", ".join(
+        dict.fromkeys(found)
+    )
+
+
+# =========================================================
+# GENERIC PLATFORM PARSER
+# =========================================================
+
+def fetch_platform(
+    url,
+    source,
+    domain_filter
+):
+
+    html = get_page(url)
+
+    if not html:
+        return []
+
+    soup = BeautifulSoup(
+        html,
+        "html.parser"
+    )
+
+    results = []
+    seen = set()
+
+    anchors = soup.find_all(
+        "a",
+        href=True
+    )
+
+    for anchor in anchors:
+
+        href = anchor.get(
+            "href",
+            ""
+        )
+
+        if not href:
+            continue
+
+        link = absolute_url(
+            url,
+            href
+        )
+
+        # Only same platform
+        if domain_filter:
+
+            if not any(
+                domain in link
+                for domain in domain_filter
+            ):
+                continue
+
+        card = get_card(
+            anchor
+        )
+
+        if not card:
+            continue
+
+        text = clean_text(
+            card.get_text(
+                " ",
+                strip=True
+            )
+        )
+
+        if len(text) < 30:
+            continue
+
+        title = get_title(
+            anchor,
+            card
+        )
+
+        if not title:
+            continue
+
+        # Ignore navigation
+        if title.lower() in [
+            "login",
+            "sign up",
+            "register",
+            "apply now",
+            "learn more",
+            "view all",
+            "home",
+            "hackathons",
+            "competitions",
+            "challenges"
+        ]:
+            continue
+
+        image = get_card_image(
+            card,
+            url
+        )
+
+        key = (
+            title.lower(),
+            link
+        )
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        results.append(
+            make_item(
+                title=title,
+                description="",
+                prize=get_prize(text),
+                category=get_category(text),
+                deadline="",
+                eligibility="",
+                link=link,
+                source=source,
+                image=image,
+                mode=get_mode(text),
+                participants=get_participants(text),
+                status=get_status(text),
+                start_date=get_date(text)
+            )
+        )
+
+    return results
+
+
+# =========================================================
+# UNSTOP
+# =========================================================
+
+def fetch_unstop():
+
+    print("Fetching Unstop")
+
+    return fetch_platform(
+        "https://unstop.com/hackathons",
+        "Unstop",
+        [
+            "unstop.com"
+        ]
+    )
 
 
 # =========================================================
@@ -460,7 +792,7 @@ def find_nearest_card(anchor):
 
 def fetch_devfolio():
 
-    source = "Devfolio"
+    print("Fetching Devfolio")
 
     url = "https://devfolio.co/hackathons"
 
@@ -477,208 +809,97 @@ def fetch_devfolio():
     results = []
     seen = set()
 
-    # Devfolio hackathon pages normally use
-    # *.devfolio.co links
-
-    anchors = soup.find_all(
+    for anchor in soup.find_all(
         "a",
         href=True
-    )
-
-    for anchor in anchors:
+    ):
 
         href = anchor.get(
             "href",
             ""
         )
 
-        if not href:
-            continue
-
-        full_link = absolute_url(
+        link = absolute_url(
             url,
             href
         )
 
-        # Actual hackathon pages
-        if ".devfolio.co" not in full_link:
+        host = urlparse(
+            link
+        ).netloc.lower()
+
+        # Actual hackathon subdomains
+        if not host.endswith(
+            ".devfolio.co"
+        ):
             continue
 
-        if full_link.rstrip("/") == url.rstrip("/"):
+        if any(
+            x in host
+            for x in [
+                "guide.",
+                "status."
+            ]
+        ):
             continue
 
-        # Ignore social/external links
-        if any(x in full_link.lower() for x in [
-            "twitter.com",
-            "x.com",
-            "discord",
-            "instagram.com",
-            "facebook.com"
-        ]):
-            continue
-
-        card = find_nearest_card(
+        card = get_card(
             anchor
         )
 
         if not card:
             continue
 
-        text = card_text(card)
-
-        # Ignore tiny/invalid cards
-        if len(text) < 20:
-            continue
-
-        title = clean_text(
-            anchor.get_text(
+        text = clean_text(
+            card.get_text(
                 " ",
                 strip=True
             )
         )
 
-        if not title:
-            title_tag = card.find(
-                [
-                    "h1",
-                    "h2",
-                    "h3",
-                    "h4",
-                    "h5"
-                ]
-            )
+        if len(text) < 30:
+            continue
 
-            if title_tag:
-                title = clean_text(
-                    title_tag.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
+        title = get_title(
+            anchor,
+            card
+        )
 
         if not title:
             continue
 
-        # Remove generic labels
-        if title.lower() in [
-            "hackathon",
-            "apply now",
-            "see projects",
-            "remind me"
-        ]:
-            continue
-
-        image = find_actual_image(
+        image = get_card_image(
             card,
             url
         )
 
-        mode = ""
-
-        if re.search(
-            r"\bOnline\b",
-            text,
-            re.I
-        ):
-            mode = "Online"
-
-        elif re.search(
-            r"\bOffline\b",
-            text,
-            re.I
-        ):
-            mode = "Offline"
-
-        status = ""
-
-        if re.search(
-            r"\bUpcoming\b",
-            text,
-            re.I
-        ):
-            status = "Upcoming"
-
-        elif re.search(
-            r"\bOpen\b",
-            text,
-            re.I
-        ):
-            status = "Open"
-
-        elif re.search(
-            r"\bEnded\b",
-            text,
-            re.I
-        ):
-            status = "Ended"
-
-        if re.search(
-            r"\bLive\b",
-            text,
-            re.I
-        ):
-            status = "Live"
-
-        participants = ""
-
-        match = re.search(
-            r"\+[\d,]+\s+(?:participating|participated)",
-            text,
-            re.I
+        mode = get_mode(
+            text
         )
 
-        if match:
-            participants = clean_text(
-                match.group(0)
-            )
+        status = get_status(
+            text
+        )
+
+        participants = get_participants(
+            text
+        )
 
         start_date = ""
 
         match = re.search(
-            r"(?:Starts|Opens)\s+(\d{1,2}/\d{1,2}/\d{2})",
+            r"(?:Starts|Opens)\s+"
+            r"(\d{1,2}/\d{1,2}/\d{2,4})",
             text,
             re.I
         )
 
         if match:
-
             start_date = match.group(1)
 
-        category_parts = []
-
-        known_themes = [
-            "AI",
-            "Blockchain",
-            "FinTech",
-            "Hardware",
-            "Design",
-            "HealthTech",
-            "Future Mobility",
-            "Web3",
-            "Gaming",
-            "No Restrictions"
-        ]
-
-        for theme in known_themes:
-
-            if re.search(
-                r"\b" + re.escape(theme) + r"\b",
-                text,
-                re.I
-            ):
-                category_parts.append(
-                    theme
-                )
-
-        category = ", ".join(
-            dict.fromkeys(
-                category_parts
-            )
-        )
-
         key = (
             title.lower(),
-            full_link
+            link
         )
 
         if key in seen:
@@ -690,12 +911,9 @@ def fetch_devfolio():
             make_item(
                 title=title,
                 description="",
-                prize="",
-                category=category,
-                deadline="",
-                eligibility="",
-                link=full_link,
-                source=source,
+                category=get_category(text),
+                link=link,
+                source="Devfolio",
                 image=image,
                 mode=mode,
                 participants=participants,
@@ -705,372 +923,6 @@ def fetch_devfolio():
         )
 
     return results
-
-
-# =========================================================
-# GENERIC CARD FETCHER
-# =========================================================
-
-def fetch_cards(
-    url,
-    source,
-    allowed_domains=None
-):
-
-    html = get_page(url)
-
-    if not html:
-        return []
-
-    soup = BeautifulSoup(
-        html,
-        "html.parser"
-    )
-
-    results = []
-    seen = set()
-
-    # First try JSON-LD
-    jsonld = extract_jsonld(
-        html,
-        source,
-        url
-    )
-
-    for item in jsonld:
-
-        if item["title"]:
-
-            key = (
-                item["title"].lower(),
-                item["link"]
-            )
-
-            if key not in seen:
-
-                seen.add(key)
-
-                results.append(
-                    item
-                )
-
-    # Then actual HTML cards
-
-    anchors = soup.find_all(
-        "a",
-        href=True
-    )
-
-    for anchor in anchors:
-
-        href = anchor.get(
-            "href",
-            ""
-        )
-
-        if not href:
-            continue
-
-        full_link = absolute_url(
-            url,
-            href
-        )
-
-        if allowed_domains:
-
-            if not any(
-                domain in full_link
-                for domain in allowed_domains
-            ):
-                continue
-
-        card = find_nearest_card(
-            anchor
-        )
-
-        if not card:
-            continue
-
-        text = card_text(card)
-
-        if len(text) < 35:
-            continue
-
-        image = find_actual_image(
-            card,
-            url
-        )
-
-        # Ignore cards without useful content
-        if not image and len(text) < 60:
-            continue
-
-        title = clean_text(
-            anchor.get_text(
-                " ",
-                strip=True
-            )
-        )
-
-        if not title:
-
-            heading = card.find(
-                [
-                    "h1",
-                    "h2",
-                    "h3",
-                    "h4",
-                    "h5",
-                    "h6"
-                ]
-            )
-
-            if heading:
-
-                title = clean_text(
-                    heading.get_text(
-                        " ",
-                        strip=True
-                    )
-                )
-
-        if not title:
-            continue
-
-        # Avoid navigation links
-        bad_titles = [
-            "login",
-            "sign up",
-            "register",
-            "apply now",
-            "learn more",
-            "view all",
-            "home",
-            "hackathons",
-            "competitions"
-        ]
-
-        if title.lower() in bad_titles:
-            continue
-
-        status = ""
-
-        for value in [
-            "Open",
-            "Upcoming",
-            "Live",
-            "Ended",
-            "Ongoing",
-            "Pre-registration",
-            "Registration closed"
-        ]:
-
-            if re.search(
-                r"\b" + re.escape(value) + r"\b",
-                text,
-                re.I
-            ):
-
-                status = value
-                break
-
-        mode = ""
-
-        if re.search(
-            r"\bOnline\b",
-            text,
-            re.I
-        ):
-            mode = "Online"
-
-        elif re.search(
-            r"\bVirtual\b",
-            text,
-            re.I
-        ):
-            mode = "Virtual"
-
-        elif re.search(
-            r"\bOffline\b",
-            text,
-            re.I
-        ):
-            mode = "Offline"
-
-        elif re.search(
-            r"\bIn[- ]person\b",
-            text,
-            re.I
-        ):
-            mode = "In-person"
-
-        participants = ""
-
-        participant_patterns = [
-            r"\+[\d,]+\s+(?:participating|participated)",
-            r"[\d,]+\s+participants?",
-            r"[\d,]+\s+teams?"
-        ]
-
-        for pattern in participant_patterns:
-
-            match = re.search(
-                pattern,
-                text,
-                re.I
-            )
-
-            if match:
-
-                participants = clean_text(
-                    match.group(0)
-                )
-
-                break
-
-        prize = ""
-
-        prize_patterns = [
-            r"(?:₹|Rs\.?|INR)\s?[\d,]+(?:\s?(?:Lakh|Crore))?",
-            r"\$[\d,]+(?:\.\d+)?",
-            r"[\d,]+\s*(?:USD|INR)",
-            r"(?:Prize Pool|Prize)\s*[:\-]?\s*[₹$]?\s?[\d,]+"
-        ]
-
-        for pattern in prize_patterns:
-
-            match = re.search(
-                pattern,
-                text,
-                re.I
-            )
-
-            if match:
-
-                prize = clean_text(
-                    match.group(0)
-                )
-
-                break
-
-        date_patterns = [
-            r"\d{1,2}/\d{1,2}/\d{2,4}",
-            r"\d{1,2}\s+[A-Za-z]{3,9}\s+\d{4}",
-            r"[A-Za-z]{3,9}\s+\d{1,2}\s*[-–]\s*\d{1,2}",
-            r"[A-Za-z]{3,9}\s+\d{1,2}\s*-\s*[A-Za-z]{3,9}\s+\d{1,2}"
-        ]
-
-        start_date = ""
-
-        for pattern in date_patterns:
-
-            match = re.search(
-                pattern,
-                text
-            )
-
-            if match:
-
-                start_date = match.group(0)
-
-                break
-
-        category = ""
-
-        known_categories = [
-            "AI",
-            "Artificial Intelligence",
-            "Blockchain",
-            "Web3",
-            "FinTech",
-            "Gaming",
-            "Design",
-            "Hardware",
-            "HealthTech",
-            "Cybersecurity",
-            "Data Science",
-            "Machine Learning",
-            "Cloud",
-            "IoT",
-            "Software Development",
-            "Future Mobility",
-            "Quantum",
-            "Biohack"
-        ]
-
-        found_categories = []
-
-        for category_name in known_categories:
-
-            if re.search(
-                r"\b" + re.escape(category_name) + r"\b",
-                text,
-                re.I
-            ):
-
-                found_categories.append(
-                    category_name
-                )
-
-        category = ", ".join(
-            dict.fromkeys(
-                found_categories
-            )
-        )
-
-        key = (
-            title.lower(),
-            full_link
-        )
-
-        if key in seen:
-            continue
-
-        seen.add(key)
-
-        results.append(
-            make_item(
-                title=title,
-                description="",
-                prize=prize,
-                category=category,
-                deadline="",
-                eligibility="",
-                link=full_link,
-                source=source,
-                image=image,
-                mode=mode,
-                participants=participants,
-                status=status,
-                start_date=start_date
-            )
-        )
-
-    return results
-
-
-# =========================================================
-# UNSTOP
-# =========================================================
-
-def fetch_unstop():
-
-    return fetch_cards(
-        "https://unstop.com/hackathons?oppstatus=open",
-        "Unstop",
-        [
-            "unstop.com/hackathons"
-        ]
-    )
-
-
-# =========================================================
-# DEVFOLIO
-# =========================================================
-
-def fetch_devfolio_source():
-
-    return fetch_devfolio()
 
 
 # =========================================================
@@ -1079,11 +931,13 @@ def fetch_devfolio_source():
 
 def fetch_hackerearth():
 
-    return fetch_cards(
+    print("Fetching HackerEarth")
+
+    return fetch_platform(
         "https://www.hackerearth.com/challenges/",
         "HackerEarth",
         [
-            "hackerearth.com/challenges"
+            "hackerearth.com"
         ]
     )
 
@@ -1094,7 +948,9 @@ def fetch_hackerearth():
 
 def fetch_hack2skill():
 
-    return fetch_cards(
+    print("Fetching Hack2Skill")
+
+    return fetch_platform(
         "https://hack2skill.com/",
         "Hack2Skill",
         [
@@ -1109,7 +965,9 @@ def fetch_hack2skill():
 
 def fetch_devpost():
 
-    return fetch_cards(
+    print("Fetching Devpost")
+
+    return fetch_platform(
         "https://devpost.com/hackathons",
         "Devpost",
         [
@@ -1124,8 +982,10 @@ def fetch_devpost():
 
 def fetch_mlh():
 
-    return fetch_cards(
-        "https://www.mlh.com/seasons/2026/events",
+    print("Fetching MLH")
+
+    return fetch_platform(
+        "https://mlh.io/seasons/2026/events",
         "MLH",
         [
             "mlh.io"
@@ -1139,11 +999,13 @@ def fetch_mlh():
 
 def fetch_kaggle():
 
-    return fetch_cards(
-        "https://www.kaggle.com/competitions?requireHackathons=true",
+    print("Fetching Kaggle")
+
+    return fetch_platform(
+        "https://www.kaggle.com/competitions",
         "Kaggle",
         [
-            "kaggle.com/competitions"
+            "kaggle.com"
         ]
     )
 
@@ -1154,11 +1016,13 @@ def fetch_kaggle():
 
 def fetch_dorahacks():
 
-    return fetch_cards(
+    print("Fetching DoraHacks")
+
+    return fetch_platform(
         "https://dorahacks.io/hackathon",
         "DoraHacks",
         [
-            "dorahacks.io/hackathon"
+            "dorahacks.io"
         ]
     )
 
@@ -1175,7 +1039,10 @@ def remove_duplicates(items):
     for item in items:
 
         title = clean_text(
-            item.get("title", "")
+            item.get(
+                "title",
+                ""
+            )
         )
 
         link = item.get(
@@ -1204,7 +1071,7 @@ def remove_duplicates(items):
 
 
 # =========================================================
-# FETCH ALL
+# ALL PLATFORMS
 # =========================================================
 
 def fetch_all():
@@ -1213,12 +1080,13 @@ def fetch_all():
 
     now = time.time()
 
-    # Cache
     if (
         CACHE["data"]
         and
         now - CACHE["time"] < CACHE_SECONDS
     ):
+
+        print("Returning cached data")
 
         return CACHE["data"]
 
@@ -1226,7 +1094,7 @@ def fetch_all():
 
     fetchers = [
         fetch_unstop,
-        fetch_devfolio_source,
+        fetch_devfolio,
         fetch_hackerearth,
         fetch_hack2skill,
         fetch_devpost,
@@ -1239,25 +1107,17 @@ def fetch_all():
 
         try:
 
-            print(
-                "Fetching:",
-                fetcher.__name__
-            )
-
             data = fetcher()
 
-            if data:
+            print(
+                fetcher.__name__,
+                "FOUND:",
+                len(data)
+            )
 
-                print(
-                    fetcher.__name__,
-                    "=>",
-                    len(data),
-                    "items"
-                )
-
-                all_items.extend(
-                    data
-                )
+            all_items.extend(
+                data
+            )
 
         except Exception as e:
 
@@ -1274,11 +1134,16 @@ def fetch_all():
     CACHE["time"] = now
     CACHE["data"] = all_items
 
+    print(
+        "TOTAL:",
+        len(all_items)
+    )
+
     return all_items
 
 
 # =========================================================
-# API
+# ROUTES
 # =========================================================
 
 @app.route("/")
@@ -1299,10 +1164,8 @@ def test():
 @app.route("/api/hackathons")
 def hackathons():
 
-    data = fetch_all()
-
     return jsonify(
-        data
+        fetch_all()
     )
 
 
